@@ -360,6 +360,111 @@ cmd_validate() {
     fi
 }
 
+# ============================================================================
+# Eval Command: Run evaluate script and parse metrics
+# ============================================================================
+
+# Parse metric from evaluate JSON output
+# Usage: parse_metric_from_json <json_string> <metric_name>
+parse_metric_from_json() {
+    local json_str="$1"
+    local metric_name="$2"
+
+    # Extract the metric value from JSON
+    echo "$json_str" | jq -r ".\"$metric_name\" // empty" 2>/dev/null
+}
+
+# Compare two metric values based on direction
+# Usage: compare_metrics <current> <best> <direction>
+# Returns: 0 if improved, 1 if regressed or same
+compare_metrics() {
+    local current="$1"
+    local best="$2"
+    local direction="$3"
+
+    # Handle non-numeric values
+    if ! { echo "$current" | grep -E '^-?[0-9]+(\.[0-9]+)?$' > /dev/null && \
+           echo "$best" | grep -E '^-?[0-9]+(\.[0-9]+)?$' > /dev/null; }; then
+        die "Invalid numeric metric values: current=$current best=$best"
+    fi
+
+    if [[ "$direction" == "maximize" ]]; then
+        # Improved if current > best
+        (( $(echo "$current > $best" | bc -l) )) && return 0 || return 1
+    else
+        # Minimized if current < best
+        (( $(echo "$current < $best" | bc -l) )) && return 0 || return 1
+    fi
+}
+
+# autolab eval: Run evaluation script and parse results
+cmd_eval() {
+    local config_dir="${1:-.}"
+    local config_file="$config_dir/autolab.yaml"
+
+    # Validate config exists and is valid
+    if [[ ! -f "$config_file" ]]; then
+        die "autolab.yaml not found at $config_file"
+    fi
+
+    if ! validate_config "$config_file" > /dev/null 2>&1; then
+        die "Invalid autolab.yaml: config validation failed"
+    fi
+
+    # Parse config
+    local config
+    if ! config=$(parse_config_to_json "$config_file"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Extract evaluate command
+    local eval_cmd
+    eval_cmd=$(echo "$config" | jq -r '.evaluate' 2>/dev/null)
+    if [[ -z "$eval_cmd" || "$eval_cmd" == "null" ]]; then
+        die "No evaluate command configured"
+    fi
+
+    # Extract metric info
+    local metric_name metric_direction
+    metric_name=$(echo "$config" | jq -r '.metric.name' 2>/dev/null)
+    metric_direction=$(echo "$config" | jq -r '.metric.direction // "maximize"' 2>/dev/null)
+
+    if [[ -z "$metric_name" || "$metric_name" == "null" ]]; then
+        die "No metric name configured"
+    fi
+
+    # Change to config directory to run evaluate command
+    cd "$config_dir"
+
+    # Run evaluate command
+    local eval_output
+    if ! eval_output=$(eval "$eval_cmd" 2>&1); then
+        die "Evaluate command failed: $eval_cmd"
+    fi
+
+    # Validate JSON
+    if ! echo "$eval_output" | jq empty 2>/dev/null; then
+        die "Evaluate script did not return valid JSON: $eval_output"
+    fi
+
+    # Parse metric from output
+    local metric_value
+    metric_value=$(parse_metric_from_json "$eval_output" "$metric_name")
+
+    if [[ -z "$metric_value" ]]; then
+        die "Metric '$metric_name' not found in evaluate output"
+    fi
+
+    # Output result as JSON
+    cat << EOF
+{
+  "metric": "$metric_name",
+  "value": $metric_value,
+  "direction": "$metric_direction"
+}
+EOF
+}
+
 # Show help
 cmd_help() {
     cat << 'HELP'
@@ -370,7 +475,8 @@ USAGE:
 
 COMMANDS:
   init [DIR]          Initialize a new project structure
-  validate            Validate autolab.yaml and evaluate.sh
+  validate [DIR]      Validate autolab.yaml
+  eval [DIR]          Run evaluate script and parse metrics
   help                Show this help message
   version             Show version
 
@@ -396,6 +502,7 @@ main() {
     case "$cmd" in
         init)      cmd_init "$@" ;;
         validate)  cmd_validate "$@" ;;
+        eval)      cmd_eval "$@" ;;
         help)      cmd_help ;;
         version)   cmd_version ;;
         *)         die "Unknown command: $cmd (use 'autolab help')" ;;
