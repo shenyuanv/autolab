@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# autolab — Automated research harness orchestrator
+# Single bash script, zero LLM in orchestrator
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check dependencies
+check_deps() {
+  local missing=()
+  for cmd in python3 jq git; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing+=("$cmd")
+    fi
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "FAIL: Missing dependencies: ${missing[*]}" >&2
+    return 1
+  fi
+
+  # Check if Python has yaml module
+  if ! python3 -c "import yaml" 2>/dev/null; then
+    echo "FAIL: Python yaml module not available" >&2
+    return 1
+  fi
+}
+
+# Parse YAML config and return as JSON
+parse_config_to_json() {
+  local config_file="$1"
+
+  if [[ ! -f "$config_file" ]]; then
+    echo "FAIL: autolab.yaml not found at $config_file" >&2
+    return 1
+  fi
+
+  # Use Python to parse YAML and convert to JSON
+  python3 -c "
+import sys
+import json
+import yaml
+
+try:
+    config_file = '$config_file'
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    if config is None:
+        config = {}
+    print(json.dumps(config))
+except yaml.YAMLError as e:
+    print(f'FAIL: Invalid YAML syntax: {e}', file=sys.stderr)
+    sys.exit(1)
+except FileNotFoundError:
+    print(f'FAIL: Config file not found: {config_file}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'FAIL: Error parsing YAML: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+}
+
+# Validate required fields and structure
+validate_config() {
+  local config_file="$1"
+
+  echo "Validating $config_file..." >&2
+
+  # Parse config to JSON
+  local config
+  if ! config=$(parse_config_to_json "$config_file"); then
+    return 1
+  fi
+
+  local errors=0
+
+  # Helper function to check if field exists
+  has_field() {
+    local field="$1"
+    echo "$config" | jq "has(\"$field\")" 2>/dev/null | grep -q "true"
+  }
+
+  # Check required string fields
+  for field in project artifacts evaluate; do
+    if ! has_field "$field"; then
+      echo "FAIL: Required field '$field' not found in autolab.yaml" >&2
+      ((errors++))
+    fi
+  done
+
+  # Check required object field: metric
+  if ! has_field "metric"; then
+    echo "FAIL: Required field 'metric' not found in autolab.yaml" >&2
+    ((errors++))
+  else
+    # Validate metric.name exists
+    if ! echo "$config" | jq '.metric.name' 2>/dev/null | grep -qv "null"; then
+      echo "FAIL: metric.name is required" >&2
+      ((errors++))
+    fi
+
+    # Validate metric.direction if present
+    local direction
+    direction=$(echo "$config" | jq -r '.metric.direction // "maximize"' 2>/dev/null)
+    if [[ "$direction" != "maximize" && "$direction" != "minimize" ]]; then
+      echo "FAIL: metric.direction must be 'maximize' or 'minimize', got '$direction'" >&2
+      ((errors++))
+    fi
+  fi
+
+  # Check artifacts is a list and not empty
+  if has_field "artifacts"; then
+    local artifacts_type
+    artifacts_type=$(echo "$config" | jq -r '.artifacts | type' 2>/dev/null)
+    if [[ "$artifacts_type" != "array" ]]; then
+      echo "FAIL: artifacts must be a list" >&2
+      ((errors++))
+    else
+      local num_artifacts
+      num_artifacts=$(echo "$config" | jq '.artifacts | length' 2>/dev/null)
+      if [[ $num_artifacts -eq 0 ]]; then
+        echo "FAIL: artifacts list must not be empty" >&2
+        ((errors++))
+      fi
+    fi
+  fi
+
+  # Validate evaluate is a string (not empty)
+  if has_field "evaluate"; then
+    local eval_value
+    eval_value=$(echo "$config" | jq -r '.evaluate' 2>/dev/null)
+    if [[ -z "$eval_value" ]]; then
+      echo "FAIL: evaluate command cannot be empty" >&2
+      ((errors++))
+    fi
+  fi
+
+  # Check optional fields exist and have correct types
+  if has_field "agent"; then
+    local agent_type
+    agent_type=$(echo "$config" | jq -r '.agent | type' 2>/dev/null)
+    if [[ "$agent_type" != "object" ]]; then
+      echo "FAIL: agent must be an object" >&2
+      ((errors++))
+    fi
+  fi
+
+  if has_field "stages"; then
+    local stages_type
+    stages_type=$(echo "$config" | jq -r '.stages | type' 2>/dev/null)
+    if [[ "$stages_type" != "array" ]]; then
+      echo "FAIL: stages must be a list" >&2
+      ((errors++))
+    else
+      # Validate each stage has an id
+      local num_stages
+      num_stages=$(echo "$config" | jq '.stages | length' 2>/dev/null)
+      for ((i = 0; i < num_stages; i++)); do
+        local stage_id
+        stage_id=$(echo "$config" | jq -r ".stages[$i].id // \"\"" 2>/dev/null)
+        if [[ -z "$stage_id" ]]; then
+          echo "FAIL: Stage $i missing required 'id' field" >&2
+          ((errors++))
+        fi
+      done
+    fi
+  fi
+
+  if has_field "stop"; then
+    local stop_type
+    stop_type=$(echo "$config" | jq -r '.stop | type' 2>/dev/null)
+    if [[ "$stop_type" != "object" ]]; then
+      echo "FAIL: stop must be an object" >&2
+      ((errors++))
+    fi
+  fi
+
+  if has_field "notify"; then
+    local notify_type
+    notify_type=$(echo "$config" | jq -r '.notify | type' 2>/dev/null)
+    if [[ "$notify_type" != "object" ]]; then
+      echo "FAIL: notify must be an object" >&2
+      ((errors++))
+    fi
+  fi
+
+  if [[ $errors -gt 0 ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+# Command: validate
+cmd_validate() {
+  local config_file="${1:-.}/autolab.yaml"
+
+  if validate_config "$config_file"; then
+    echo "✓ autolab.yaml is valid" >&2
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Main CLI
+main() {
+  check_deps || return 1
+
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    validate)
+      cmd_validate "$@"
+      ;;
+    *)
+      echo "Usage: autolab <command> [args]" >&2
+      echo "Commands: validate" >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
