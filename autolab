@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Autolab — Automated Research Harness CLI
+# Single bash script, no build step, zero LLM in orchestrator
+
+AUTOLAB_VERSION="0.1.0"
+AUTOLAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "INFO: $*" >&2
+}
+
+# Check required dependencies
+check_deps() {
+    local missing=()
+    for cmd in git jq yq; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required commands: ${missing[*]}"
+    fi
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+# autolab init: Initialize a new project
+cmd_init() {
+    local project_dir="${1:-.}"
+
+    # Create project directory if needed
+    if [[ ! -d "$project_dir" ]]; then
+        mkdir -p "$project_dir"
+    fi
+
+    cd "$project_dir"
+
+    # Check if autolab.yaml already exists (don't overwrite)
+    if [[ -f autolab.yaml ]]; then
+        info "autolab.yaml already exists, skipping"
+    else
+        # Create autolab.yaml template
+        cat > autolab.yaml << 'YAML'
+# Autolab Configuration
+project: my-research
+description: "A research project"
+
+# What the agent modifies
+artifacts:
+  - artifact.py
+
+# How to evaluate (must output JSON to stdout)
+evaluate: "python3 evaluate.py --json"
+
+# Primary metric to optimize
+metric:
+  name: f1
+  direction: maximize  # or minimize
+
+# Agent configuration
+agent:
+  command: claude
+  flags: "--dangerously-skip-permissions --max-turns 30"
+
+# Roadmap
+stages:
+  - id: baseline
+    goal: "Establish baseline"
+    metric: f1
+    threshold: 0.60
+
+# Stop conditions
+stop:
+  max_rounds: 50
+  plateau: 5
+  time_limit: "1h"
+
+# Notifications
+notify:
+  slack_channel: null
+  on: []
+YAML
+        info "Created autolab.yaml"
+    fi
+
+    # Create program.md template
+    if [[ -f program.md ]]; then
+        info "program.md already exists, skipping"
+    else
+        cat > program.md << 'MD'
+# Research Instructions
+
+## Objective
+Describe the research goal and what success looks like.
+
+## Current State
+The agent will see the current artifact and recent experiment history.
+
+## Task
+Make one focused improvement to the artifact(s).
+
+## Evaluation
+The evaluation script will automatically measure performance.
+
+## Tips
+- One change per round
+- Document your reasoning
+- Each round is independent
+MD
+        info "Created program.md"
+    fi
+
+    # Create evaluate.sh template
+    if [[ -f evaluate.sh ]]; then
+        info "evaluate.sh already exists, skipping"
+    else
+        cat > evaluate.sh << 'EVAL'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Evaluation script
+# Must output valid JSON to stdout
+# Exit 0 on success, non-zero on failure
+
+# Example: run some test and compute metrics
+# PRECISION=$(python3 -c "print(0.91)")
+# RECALL=$(python3 -c "print(0.84)")
+# F1=$(python3 -c "print(0.87)")
+
+# For now, output dummy metrics for testing
+cat << 'JSON'
+{
+  "f1": 0.75,
+  "precision": 0.80,
+  "recall": 0.71
+}
+JSON
+EVAL
+        chmod +x evaluate.sh
+        info "Created evaluate.sh (executable)"
+    fi
+
+    # Create directory structure
+    local dirs=(
+        "artifacts"
+        "data"
+        "checkpoints/best"
+        "checkpoints/history"
+        "results/rounds"
+    )
+
+    for dir in "${dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            info "Created directory: $dir"
+        fi
+    done
+
+    # Create .gitignore if it doesn't exist
+    if [[ -f .gitignore ]]; then
+        info ".gitignore already exists, skipping"
+    else
+        cat > .gitignore << 'GITIGNORE'
+# Autolab directories
+results/
+checkpoints/
+*.log
+__pycache__/
+*.pyc
+.env
+GITIGNORE
+        info "Created .gitignore"
+    fi
+
+    # Initialize git repo if needed
+    if [[ ! -d .git ]]; then
+        git init > /dev/null
+        git config user.email "autolab@local" 2>/dev/null || true
+        git config user.name "Autolab" 2>/dev/null || true
+        info "Initialized git repository"
+    fi
+
+    # Add initial commit if there are no commits yet
+    if ! git rev-parse HEAD &>/dev/null; then
+        # Stage all files
+        git add autolab.yaml program.md evaluate.sh .gitignore
+        git commit -m "Initial autolab project setup" > /dev/null || true
+        info "Created initial git commit"
+    fi
+
+    echo "Autolab project initialized in $(pwd)"
+}
+
+# Show help
+cmd_help() {
+    cat << 'HELP'
+autolab — Automated Research Harness
+
+USAGE:
+  autolab <command> [args]
+
+COMMANDS:
+  init [DIR]          Initialize a new project structure
+  validate            Validate autolab.yaml and evaluate.sh
+  help                Show this help message
+  version             Show version
+
+For more information, see DESIGN.md and CLAUDE.md
+HELP
+}
+
+# Show version
+cmd_version() {
+    echo "autolab version $AUTOLAB_VERSION"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    check_deps
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)      cmd_init "$@" ;;
+        validate)  die "validate not yet implemented" ;;
+        help)      cmd_help ;;
+        version)   cmd_version ;;
+        *)         die "Unknown command: $cmd (use 'autolab help')" ;;
+    esac
+}
+
+main "$@"
