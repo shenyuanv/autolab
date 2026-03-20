@@ -361,6 +361,83 @@ cmd_validate() {
 }
 
 # ============================================================================
+# Checkpoint Management
+# ============================================================================
+
+# promote: Create checkpoint on improvement
+# Usage: promote <round> <metric_value> <metric_name>
+promote() {
+    local round="$1"
+    local metric_value="$2"
+    local metric_name="$3"
+
+    if [[ ! -d checkpoints/best ]]; then
+        mkdir -p checkpoints/best
+    fi
+
+    if [[ ! -d checkpoints/history ]]; then
+        mkdir -p checkpoints/history
+    fi
+
+    # Format round number with zero padding (e.g., round-001)
+    local round_dir="checkpoints/history/round-$(printf '%03d' "$round")"
+    mkdir -p "$round_dir"
+
+    # Parse config to get artifacts list
+    local config
+    if ! config=$(parse_config_to_json "autolab.yaml"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Copy each artifact to both best/ and history/round-NNN/
+    local num_artifacts
+    num_artifacts=$(echo "$config" | jq '.artifacts | length' 2>/dev/null)
+    for ((i = 0; i < num_artifacts; i++)); do
+        local artifact
+        artifact=$(echo "$config" | jq -r ".artifacts[$i]" 2>/dev/null)
+        if [[ -n "$artifact" && -f "$artifact" ]]; then
+            cp "$artifact" "checkpoints/best/$artifact"
+            cp "$artifact" "$round_dir/$artifact"
+        fi
+    done
+
+    # Create git commit with round and metrics in message
+    local commit_msg="Checkpoint: Round $round — $metric_name: $metric_value"
+    git add checkpoints/best > /dev/null 2>&1 || true
+    git add checkpoints/history > /dev/null 2>&1 || true
+    git commit -m "$commit_msg" > /dev/null 2>&1 || true
+
+    info "Promoted checkpoint for round $round ($metric_name: $metric_value)"
+}
+
+# discard: Revert artifacts to last best checkpoint on regression
+discard() {
+    if [[ ! -d checkpoints/best ]]; then
+        # No best checkpoint yet, nothing to discard
+        return 0
+    fi
+
+    # Parse config to get artifacts list
+    local config
+    if ! config=$(parse_config_to_json "autolab.yaml"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Restore each artifact from best/
+    local num_artifacts
+    num_artifacts=$(echo "$config" | jq '.artifacts | length' 2>/dev/null)
+    for ((i = 0; i < num_artifacts; i++)); do
+        local artifact
+        artifact=$(echo "$config" | jq -r ".artifacts[$i]" 2>/dev/null)
+        if [[ -n "$artifact" && -f "checkpoints/best/$artifact" ]]; then
+            cp "checkpoints/best/$artifact" "$artifact"
+        fi
+    done
+
+    info "Discarded artifacts and reverted to best checkpoint"
+}
+
+# ============================================================================
 # Eval Command: Run evaluate script and parse metrics
 # ============================================================================
 
@@ -395,6 +472,59 @@ compare_metrics() {
         # Minimized if current < best
         (( $(echo "$current < $best" | bc -l) )) && return 0 || return 1
     fi
+}
+
+# autolab promote: Create checkpoint on improvement
+cmd_promote() {
+    local round="${1:-}"
+    local metric_value="${2:-}"
+    local metric_name="${3:-}"
+
+    if [[ -z "$round" || -z "$metric_value" || -z "$metric_name" ]]; then
+        die "Usage: autolab promote <round> <metric_value> <metric_name>"
+    fi
+
+    promote "$round" "$metric_value" "$metric_name"
+}
+
+# autolab discard: Revert artifacts to last best checkpoint
+cmd_discard() {
+    discard
+}
+
+# autolab restore: Restore artifacts from a specific checkpoint
+cmd_restore() {
+    local round="${1:-}"
+
+    if [[ -z "$round" ]]; then
+        die "Usage: autolab restore <round>"
+    fi
+
+    # Format round number with zero padding
+    local round_dir="checkpoints/history/round-$(printf '%03d' "$round")"
+
+    if [[ ! -d "$round_dir" ]]; then
+        die "Checkpoint for round $round not found at $round_dir"
+    fi
+
+    # Parse config to get artifacts list
+    local config
+    if ! config=$(parse_config_to_json "autolab.yaml"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Restore each artifact from the checkpoint
+    local num_artifacts
+    num_artifacts=$(echo "$config" | jq '.artifacts | length' 2>/dev/null)
+    for ((i = 0; i < num_artifacts; i++)); do
+        local artifact
+        artifact=$(echo "$config" | jq -r ".artifacts[$i]" 2>/dev/null)
+        if [[ -n "$artifact" && -f "$round_dir/$artifact" ]]; then
+            cp "$round_dir/$artifact" "$artifact"
+        fi
+    done
+
+    info "Restored artifacts from round $round"
 }
 
 # autolab eval: Run evaluation script and parse results
@@ -474,11 +604,14 @@ USAGE:
   autolab <command> [args]
 
 COMMANDS:
-  init [DIR]          Initialize a new project structure
-  validate [DIR]      Validate autolab.yaml
-  eval [DIR]          Run evaluate script and parse metrics
-  help                Show this help message
-  version             Show version
+  init [DIR]                      Initialize a new project structure
+  validate [DIR]                  Validate autolab.yaml
+  eval [DIR]                      Run evaluate script and parse metrics
+  promote <round> <value> <name>  Create checkpoint on improvement
+  discard                         Revert artifacts to last best checkpoint
+  restore <round>                 Restore artifacts from specific checkpoint
+  help                            Show this help message
+  version                         Show version
 
 For more information, see DESIGN.md and CLAUDE.md
 HELP
@@ -503,6 +636,9 @@ main() {
         init)      cmd_init "$@" ;;
         validate)  cmd_validate "$@" ;;
         eval)      cmd_eval "$@" ;;
+        promote)   cmd_promote "$@" ;;
+        discard)   cmd_discard "$@" ;;
+        restore)   cmd_restore "$@" ;;
         help)      cmd_help ;;
         version)   cmd_version ;;
         *)         die "Unknown command: $cmd (use 'autolab help')" ;;
