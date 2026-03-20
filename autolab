@@ -820,7 +820,7 @@ wait_for_agent() {
             return 0
         fi
         sleep 1
-        ((elapsed++))
+        elapsed=$((elapsed + 1))
     done
 
     die "Agent timeout after ${timeout}s for round $(basename $round_dir)"

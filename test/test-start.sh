@@ -74,8 +74,7 @@ EOF
 chmod +x evaluate.sh
 
 # Run start command with timeout (should stop after 3 rounds)
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Check that experiments.jsonl was created
 assert_file_exists "results/experiments.jsonl"
@@ -120,8 +119,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Should have at most 2 rounds
 [[ -d "results/rounds/round-001" ]] || fail "round-001 should exist"
@@ -166,8 +164,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Should have exactly 3 rounds (1 baseline + 2 no improvement = plateau)
 [[ -d "results/rounds/round-001" ]] || fail "round-001 should exist"
@@ -240,8 +237,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Should have checkpoints for round 1 (improvement to 0.75) and round 3 (improvement to 0.80 after regression)
 assert_file_exists "checkpoints/history/round-001/artifact.py"
@@ -286,8 +282,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Check experiments.jsonl exists and has at least one entry
 assert_file_exists "results/experiments.jsonl"
@@ -345,8 +340,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Check experiments.jsonl for stage information
 assert_file_exists "results/experiments.jsonl"
@@ -394,8 +388,7 @@ stop:
 EOF
 
 # Run start
-timeout 30 "$AUTOLAB" start > /tmp/autolab-start-debug.log 2>&1 || true
-cat /tmp/autolab-start-debug.log >&2
+timeout 30 "$AUTOLAB" start > /dev/null 2>&1 || true
 
 # Should have created all 5 rounds since each improves
 [[ -d "results/rounds/round-001" ]] || fail "round-001 should exist"
