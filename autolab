@@ -207,7 +207,7 @@ artifacts:
   - artifact.py
 
 # How to evaluate (must output JSON to stdout)
-evaluate: "python3 evaluate.py --json"
+evaluate: "bash evaluate.sh"
 
 # Primary metric to optimize
 metric:
@@ -753,6 +753,326 @@ cmd_spawn() {
     spawn_agent "$round" "$config_dir"
 }
 
+# ============================================================================
+# Core Loop: Start command implementation
+# ============================================================================
+
+# Load best metrics from checkpoint history
+# Returns JSON with metric info or "{}" if no best exists
+load_best_metrics() {
+    local best_file="checkpoints/best/.best_metrics.json"
+
+    if [[ -f "$best_file" ]]; then
+        cat "$best_file"
+    else
+        echo "{}"
+    fi
+}
+
+# Load best metric value
+# Usage: get_best_metric_value <metric_name>
+get_best_metric_value() {
+    local metric_name="$1"
+    local best_json
+    best_json=$(load_best_metrics)
+
+    if echo "$best_json" | jq -e ".value" > /dev/null 2>&1; then
+        echo "$best_json" | jq -r '.value' 2>/dev/null
+    else
+        echo ""
+    fi
+}
+
+# Check if agent process is still running
+# Usage: is_agent_running <round_dir>
+is_agent_running() {
+    local round_dir="$1"
+    local pid_file="$round_dir/agent.pid"
+
+    if [[ ! -f "$pid_file" ]]; then
+        return 1
+    fi
+
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null) || return 1
+
+    if [[ -z "$pid" ]]; then
+        return 1
+    fi
+
+    # Check if process exists
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Wait for agent to finish running
+# Usage: wait_for_agent <round_dir> [timeout_seconds]
+wait_for_agent() {
+    local round_dir="$1"
+    local timeout="${2:-600}"  # default 10 minutes
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if ! is_agent_running "$round_dir"; then
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    die "Agent timeout after ${timeout}s for round $(basename $round_dir)"
+}
+
+# Run evaluation and save metrics
+# Usage: run_and_save_eval <round_dir> <config_dir>
+run_and_save_eval() {
+    local round_dir="$1"
+    local config_dir="$2"
+
+    # Run eval command and save output
+    local eval_output
+    if eval_output=$("$0" eval "$config_dir" 2>&1); then
+        # Save eval output
+        echo "$eval_output" > "$round_dir/eval-output.json"
+        echo "$eval_output"
+    else
+        die "Evaluation failed for $(basename $round_dir)"
+    fi
+}
+
+# Append entry to experiments.jsonl
+# Usage: append_experiment_entry <config_dir> <round> <metrics_json>
+append_experiment_entry() {
+    local config_dir="$1"
+    local round="$2"
+    local metrics_json="$3"
+    local improved="${4:-false}"
+    local stage="${5:-baseline}"
+
+    local exp_file="$config_dir/results/experiments.jsonl"
+    mkdir -p "$(dirname "$exp_file")"
+
+    # Extract metric value from JSON
+    local metric_value
+    metric_value=$(echo "$metrics_json" | jq -r '.value // "null"' 2>/dev/null)
+
+    # Create experiment entry as single-line JSON (compact output)
+    local entry
+    entry=$(jq -cn \
+        --arg round "$round" \
+        --arg metric_value "$metric_value" \
+        --arg improved "$improved" \
+        --arg stage "$stage" \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{round: ($round|tonumber), metric_value: ($metric_value|tonumber), improved: ($improved|test("true")), stage: $stage, timestamp: $timestamp}')
+
+    echo "$entry" >> "$exp_file"
+}
+
+# Load last recorded best metric from experiments.jsonl
+# Returns the metric value or empty string if none
+get_last_best_metric() {
+    local exp_file="results/experiments.jsonl"
+
+    if [[ ! -f "$exp_file" ]]; then
+        echo ""
+        return
+    fi
+
+    # Find last entry with improved=true
+    local last_best
+    last_best=$(grep '"improved": true' "$exp_file" | tail -1 | jq -r '.metric_value // ""' 2>/dev/null)
+
+    if [[ -z "$last_best" ]]; then
+        # If no improvement yet, get first entry's value
+        last_best=$(tail -1 "$exp_file" | jq -r '.metric_value // ""' 2>/dev/null)
+    fi
+
+    echo "$last_best"
+}
+
+# Count consecutive rounds without improvement
+# Returns the count
+count_plateau_rounds() {
+    local exp_file="results/experiments.jsonl"
+
+    if [[ ! -f "$exp_file" ]]; then
+        echo "0"
+        return
+    fi
+
+    # Count from the end backwards until we find a line with improved=true
+    local count=0
+
+    # Process file in reverse
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        # Check if this line has improved=true
+        if echo "$line" | jq -e '.improved == true' > /dev/null 2>&1; then
+            # Found an improvement, return the count
+            echo "$count"
+            return
+        fi
+
+        # Count this line as no improvement
+        ((count++))
+    done < <(tac "$exp_file")
+
+    # If we get here, no improvements found at all
+    echo "$count"
+}
+
+# Determine if we should stop the loop
+# Usage: should_stop <config_json> <current_round>
+should_stop() {
+    local config="$1"
+    local current_round="$2"
+
+    # Check max_rounds
+    local max_rounds
+    max_rounds=$(echo "$config" | jq -r '.stop.max_rounds // 100' 2>/dev/null)
+
+    if [[ $current_round -ge $max_rounds ]]; then
+        info "Reached max rounds ($current_round >= $max_rounds)"
+        return 0
+    fi
+
+    # Check plateau
+    local plateau_threshold
+    plateau_threshold=$(echo "$config" | jq -r '.stop.plateau // 10' 2>/dev/null)
+
+    local plateau_count
+    plateau_count=$(count_plateau_rounds)
+
+    if [[ $plateau_count -ge $plateau_threshold ]]; then
+        info "Plateau detected: $plateau_count rounds without improvement"
+        return 0
+    fi
+
+    return 1
+}
+
+# autolab start: Main research loop
+cmd_start() {
+    local config_dir="${1:-.}"
+    local config_file="$config_dir/autolab.yaml"
+
+    # Validate config
+    if [[ ! -f "$config_file" ]]; then
+        die "autolab.yaml not found at $config_file"
+    fi
+
+    if ! validate_config "$config_file" > /dev/null 2>&1; then
+        die "Invalid autolab.yaml: config validation failed"
+    fi
+
+    # Parse config
+    local config
+    if ! config=$(parse_config_to_json "$config_file"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Extract config values
+    local max_rounds
+    max_rounds=$(echo "$config" | jq -r '.stop.max_rounds // 100' 2>/dev/null)
+    local metric_name
+    metric_name=$(echo "$config" | jq -r '.metric.name' 2>/dev/null)
+    local metric_direction
+    metric_direction=$(echo "$config" | jq -r '.metric.direction // "maximize"' 2>/dev/null)
+
+    info "Starting research loop: max_rounds=$max_rounds, metric=$metric_name"
+
+    # Initialize state
+    local current_round=1
+    local best_metric=""
+
+    # Main loop
+    while true; do
+        local round_num
+        round_num=$(printf '%03d' "$current_round")
+        local round_dir="$config_dir/results/rounds/round-$round_num"
+
+        info "=== Round $current_round ==="
+
+        # Spawn agent
+        spawn_agent "$current_round" "$config_dir"
+
+        # Wait for agent to complete
+        wait_for_agent "$round_dir" 300
+
+        # Run evaluation
+        info "Running evaluation for round $current_round..."
+        local eval_output
+        eval_output=$(run_and_save_eval "$round_dir" "$config_dir")
+
+        # Parse metrics
+        local metric_value
+        metric_value=$(echo "$eval_output" | jq -r '.value // empty' 2>/dev/null)
+
+        if [[ -z "$metric_value" ]]; then
+            die "Failed to extract metric value from evaluation"
+        fi
+
+        info "Round $current_round: $metric_name = $metric_value"
+
+        # Determine if improved
+        local improved=false
+        if [[ -z "$best_metric" ]]; then
+            # First round - always improve
+            improved=true
+            best_metric="$metric_value"
+        else
+            # Compare metrics
+            if compare_metrics "$metric_value" "$best_metric" "$metric_direction"; then
+                improved=true
+                best_metric="$metric_value"
+            fi
+        fi
+
+        # Promote or discard
+        if [[ "$improved" == "true" ]]; then
+            promote "$current_round" "$metric_value" "$metric_name"
+
+            # Save best metrics
+            mkdir -p "$config_dir/checkpoints/best"
+            cat > "$config_dir/checkpoints/best/.best_metrics.json" << EOF
+{
+  "metric": "$metric_name",
+  "value": $metric_value,
+  "direction": "$metric_direction",
+  "round": $current_round
+}
+EOF
+        else
+            discard
+            info "Discarded round $current_round (regression or no improvement)"
+        fi
+
+        # Log experiment entry
+        append_experiment_entry "$config_dir" "$current_round" "$eval_output" "$improved" "baseline"
+
+        # Check stop conditions
+        if should_stop "$config" "$current_round"; then
+            info "Research loop stopped after $current_round rounds"
+            break
+        fi
+
+        # Increment round
+        ((current_round++))
+
+        # Small delay before next round
+        sleep 1
+    done
+
+    info "Research complete"
+    echo "Final best metric: $metric_name = $best_metric"
+}
+
 # Show help
 cmd_help() {
     cat << 'HELP'
@@ -764,6 +1084,7 @@ USAGE:
 COMMANDS:
   init [DIR]                      Initialize a new project structure
   validate [DIR]                  Validate autolab.yaml
+  start [DIR]                     Run main research loop (foreground)
   spawn <round> [DIR]             Spawn sub-agent for a research round
   eval [DIR]                      Run evaluate script and parse metrics
   promote <round> <value> <name>  Create checkpoint on improvement
@@ -794,6 +1115,7 @@ main() {
     case "$cmd" in
         init)      cmd_init "$@" ;;
         validate)  cmd_validate "$@" ;;
+        start)     cmd_start "$@" ;;
         spawn)     cmd_spawn "$@" ;;
         eval)      cmd_eval "$@" ;;
         promote)   cmd_promote "$@" ;;
