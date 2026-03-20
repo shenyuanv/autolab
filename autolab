@@ -438,6 +438,156 @@ discard() {
 }
 
 # ============================================================================
+# Spawn: Launch sub-agent for a research round
+# ============================================================================
+
+# Generate prompt for sub-agent
+# Usage: generate_prompt <round> <config_json>
+generate_prompt() {
+    local round="$1"
+    local config="$2"
+
+    # Extract config fields
+    local project metric_name metric_dir stage_id stage_goal max_rounds
+    project=$(echo "$config" | jq -r '.project // "unknown"' 2>/dev/null)
+    metric_name=$(echo "$config" | jq -r '.metric.name // "f1"' 2>/dev/null)
+    metric_dir=$(echo "$config" | jq -r '.metric.direction // "maximize"' 2>/dev/null)
+    max_rounds=$(echo "$config" | jq -r '.stop.max_rounds // 50' 2>/dev/null)
+
+    # Get stage info if available
+    if echo "$config" | jq '.stages' 2>/dev/null | grep -q "^\["; then
+        local num_stages
+        num_stages=$(echo "$config" | jq '.stages | length' 2>/dev/null)
+        if [[ $num_stages -gt 0 ]]; then
+            # Get first stage (baseline)
+            stage_id=$(echo "$config" | jq -r '.stages[0].id // ""' 2>/dev/null)
+            stage_goal=$(echo "$config" | jq -r '.stages[0].goal // ""' 2>/dev/null)
+        fi
+    fi
+
+    # Default values
+    stage_id="${stage_id:-baseline}"
+    stage_goal="${stage_goal:-Improve the artifact}"
+
+    # Get artifacts list
+    local artifacts_str=""
+    if echo "$config" | jq '.artifacts' 2>/dev/null | grep -q "^\["; then
+        local num_artifacts
+        num_artifacts=$(echo "$config" | jq '.artifacts | length' 2>/dev/null)
+        for ((i = 0; i < num_artifacts; i++)); do
+            local artifact
+            artifact=$(echo "$config" | jq -r ".artifacts[$i]" 2>/dev/null)
+            if [[ -n "$artifact" ]]; then
+                if [[ -z "$artifacts_str" ]]; then
+                    artifacts_str="$artifact"
+                else
+                    artifacts_str="$artifacts_str, $artifact"
+                fi
+            fi
+        done
+    fi
+    artifacts_str="${artifacts_str:-artifact.py}"
+
+    # Get evaluate command
+    local eval_cmd
+    eval_cmd=$(echo "$config" | jq -r '.evaluate // ""' 2>/dev/null)
+
+    # Get threshold if available
+    local threshold=""
+    if echo "$config" | jq '.stages' 2>/dev/null | grep -q "^\["; then
+        threshold=$(echo "$config" | jq -r '.stages[0].threshold // ""' 2>/dev/null)
+    fi
+
+    # Generate the prompt
+    cat << PROMPT
+# Research Round $round
+
+## Your Task
+Read program.md for the full research context. You are in stage: $stage_id.
+Goal: $stage_goal
+Target: $metric_name $metric_dir ${threshold:-(no threshold set)} (current best: N/A for round 1)
+
+## Current State
+- Round: $round of max $max_rounds
+- Stage: $stage_id (1/1)
+- Best $metric_name: N/A (not yet evaluated)
+- Rounds since improvement: 0
+
+## Instructions
+1. Read program.md for detailed research instructions
+2. Examine the current artifact(s): $artifacts_str
+3. Make ONE focused improvement
+4. Run the evaluation: $eval_cmd
+5. Report the results
+
+Do NOT try multiple changes in one round. One change, one eval.
+PROMPT
+}
+
+# Spawn sub-agent for a research round
+# Usage: spawn_agent <round> <config_dir>
+spawn_agent() {
+    local round="$1"
+    local config_dir="${2:-.}"
+
+    local config_file="$config_dir/autolab.yaml"
+
+    # Validate config
+    if [[ ! -f "$config_file" ]]; then
+        die "autolab.yaml not found at $config_file"
+    fi
+
+    if ! validate_config "$config_file" > /dev/null 2>&1; then
+        die "Invalid autolab.yaml: config validation failed"
+    fi
+
+    # Parse config
+    local config
+    if ! config=$(parse_config_to_json "$config_file"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Create round directory
+    local round_num
+    round_num=$(printf '%03d' "$round")
+    local round_dir="$config_dir/results/rounds/round-$round_num"
+    mkdir -p "$round_dir"
+
+    # Create results directory if needed
+    mkdir -p "$config_dir/results"
+
+    # Generate prompt
+    local prompt
+    prompt=$(generate_prompt "$round" "$config")
+
+    # Get agent command and flags from config
+    local agent_cmd agent_flags
+    agent_cmd=$(echo "$config" | jq -r '.agent.command // "claude"' 2>/dev/null)
+    agent_flags=$(echo "$config" | jq -r '.agent.flags // ""' 2>/dev/null)
+
+    # Save prompt to round directory
+    echo "$prompt" > "$round_dir/prompt.txt"
+
+    # Spawn agent in background with prompt
+    # The agent receives the prompt as context and logs output to the round directory
+    cd "$config_dir"
+
+    # Launch agent with prompt, capture PID, and save log
+    {
+        echo "$prompt"
+        echo ""
+        echo "---AGENT-START---"
+    } | $agent_cmd $agent_flags > "$round_dir/agent.log" 2>&1 &
+
+    local agent_pid=$!
+
+    # Save PID to round directory
+    echo "$agent_pid" > "$round_dir/agent.pid"
+
+    info "Spawned agent for round $round (PID: $agent_pid, log: $round_dir/agent.log)"
+}
+
+# ============================================================================
 # Eval Command: Run evaluate script and parse metrics
 # ============================================================================
 
@@ -595,6 +745,14 @@ cmd_eval() {
 EOF
 }
 
+# autolab spawn: Spawn sub-agent for a research round
+cmd_spawn() {
+    local round="${1:-1}"
+    local config_dir="${2:-.}"
+
+    spawn_agent "$round" "$config_dir"
+}
+
 # Show help
 cmd_help() {
     cat << 'HELP'
@@ -606,6 +764,7 @@ USAGE:
 COMMANDS:
   init [DIR]                      Initialize a new project structure
   validate [DIR]                  Validate autolab.yaml
+  spawn <round> [DIR]             Spawn sub-agent for a research round
   eval [DIR]                      Run evaluate script and parse metrics
   promote <round> <value> <name>  Create checkpoint on improvement
   discard                         Revert artifacts to last best checkpoint
@@ -635,6 +794,7 @@ main() {
     case "$cmd" in
         init)      cmd_init "$@" ;;
         validate)  cmd_validate "$@" ;;
+        spawn)     cmd_spawn "$@" ;;
         eval)      cmd_eval "$@" ;;
         promote)   cmd_promote "$@" ;;
         discard)   cmd_discard "$@" ;;
