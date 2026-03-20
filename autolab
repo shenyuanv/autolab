@@ -754,6 +754,127 @@ cmd_spawn() {
 }
 
 # ============================================================================
+# Status and History Commands
+# ============================================================================
+
+# autolab status: Show current state
+cmd_status() {
+    local config_dir="${1:-.}"
+    local config_file="$config_dir/autolab.yaml"
+    local exp_file="$config_dir/results/experiments.jsonl"
+
+    # Validate config exists
+    if [[ ! -f "$config_file" ]]; then
+        die "autolab.yaml not found at $config_file"
+    fi
+
+    # Parse config
+    local config
+    if ! config=$(parse_config_to_json "$config_file"); then
+        die "Failed to parse autolab.yaml"
+    fi
+
+    # Extract metric info
+    local metric_name
+    metric_name=$(echo "$config" | jq -r '.metric.name' 2>/dev/null)
+
+    # Load best metrics if available
+    local best_json
+    best_json=$(load_best_metrics)
+
+    echo "=== Autolab Status ==="
+    echo ""
+
+    # Check if experiments have been run
+    if [[ ! -f "$exp_file" ]]; then
+        echo "Status: No experiments run yet"
+        echo "Total rounds: 0"
+        return 0
+    fi
+
+    # Count total rounds
+    local total_rounds
+    total_rounds=$(wc -l < "$exp_file" 2>/dev/null | tr -d ' ' || echo "0")
+
+    # Get best metric info
+    local best_metric best_round
+    if echo "$best_json" | jq -e '.value' > /dev/null 2>&1; then
+        best_metric=$(echo "$best_json" | jq -r '.value' 2>/dev/null)
+        best_round=$(echo "$best_json" | jq -r '.round // "unknown"' 2>/dev/null)
+        echo "Status: Completed"
+        echo "Best metric ($metric_name): $best_metric (round $best_round)"
+    else
+        echo "Status: Completed"
+        echo "Best metric ($metric_name): None yet"
+    fi
+
+    echo "Total rounds: $total_rounds"
+
+    # Count plateau
+    local plateau_count
+    plateau_count=$(count_plateau_rounds)
+    echo "Rounds since improvement: $plateau_count"
+
+    # Show last round metrics if available
+    if [[ -f "$exp_file" && $total_rounds -gt 0 ]]; then
+        local last_entry
+        last_entry=$(tail -1 "$exp_file")
+        local last_metric last_improved last_timestamp
+        last_metric=$(echo "$last_entry" | jq -r '.metric_value // "unknown"' 2>/dev/null)
+        last_improved=$(echo "$last_entry" | jq -r '.improved // false' 2>/dev/null)
+        last_timestamp=$(echo "$last_entry" | jq -r '.timestamp // "unknown"' 2>/dev/null)
+        echo ""
+        echo "Last round: Round $total_rounds"
+        echo "  Metric: $last_metric"
+        echo "  Improved: $last_improved"
+        echo "  Time: $last_timestamp"
+    fi
+}
+
+# autolab history: List all experiments
+cmd_history() {
+    local config_dir="${1:-.}"
+    local exp_file="$config_dir/results/experiments.jsonl"
+
+    # Check if experiments file exists
+    if [[ ! -f "$exp_file" ]]; then
+        echo "No experiments recorded yet"
+        return 0
+    fi
+
+    # Check if file is empty
+    if [[ ! -s "$exp_file" ]]; then
+        echo "No experiments recorded yet"
+        return 0
+    fi
+
+    # Print header
+    printf "%-8s %-15s %-12s %-30s\n" "Round" "Metric" "Improved" "Timestamp"
+    printf "%-8s %-15s %-12s %-30s\n" "-----" "------" "---------" "---------"
+
+    # Process each line and format as table
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        local round metric improved timestamp
+        round=$(echo "$line" | jq -r '.round // "-"' 2>/dev/null)
+        metric=$(echo "$line" | jq -r '.metric_value // "-"' 2>/dev/null)
+        improved=$(echo "$line" | jq -r '.improved // false' 2>/dev/null)
+        timestamp=$(echo "$line" | jq -r '.timestamp // "-"' 2>/dev/null)
+
+        # Format improved as checkmark or dash
+        if [[ "$improved" == "true" ]]; then
+            improved="✓"
+        else
+            improved="-"
+        fi
+
+        printf "%-8s %-15s %-12s %-30s\n" "$round" "$metric" "$improved" "$timestamp"
+    done < "$exp_file"
+}
+
+# ============================================================================
 # Core Loop: Start command implementation
 # ============================================================================
 
@@ -1084,6 +1205,8 @@ USAGE:
 COMMANDS:
   init [DIR]                      Initialize a new project structure
   validate [DIR]                  Validate autolab.yaml
+  status [DIR]                    Show current state and best metrics
+  history [DIR]                   List all experiments
   start [DIR]                     Run main research loop (foreground)
   spawn <round> [DIR]             Spawn sub-agent for a research round
   eval [DIR]                      Run evaluate script and parse metrics
@@ -1115,6 +1238,8 @@ main() {
     case "$cmd" in
         init)      cmd_init "$@" ;;
         validate)  cmd_validate "$@" ;;
+        status)    cmd_status "$@" ;;
+        history)   cmd_history "$@" ;;
         start)     cmd_start "$@" ;;
         spawn)     cmd_spawn "$@" ;;
         eval)      cmd_eval "$@" ;;
