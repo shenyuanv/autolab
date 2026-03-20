@@ -41,7 +41,7 @@ cat > "$BIN_DIR/claude" << 'CLAUDE'
 #!/usr/bin/env bash
 # Read round number from prompt, output improving metrics
 prompt=$(cat)
-round=$(echo "$prompt" | grep -oP "Research Round \K[0-9]+" | head -1)
+round=$(echo "$prompt" | sed -n "s/.*Research Round \([0-9][0-9]*\).*/\1/p" | head -1)
 if [[ -z "$round" ]]; then round=1; fi
 
 # Simulate improving metrics
@@ -307,7 +307,7 @@ mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/claude" << 'CLAUDE'
 #!/usr/bin/env bash
 prompt=$(cat)
-round=$(echo "$prompt" | grep -oP "Research Round \K[0-9]+" | head -1)
+round=$(echo "$prompt" | sed -n "s/.*Research Round \([0-9][0-9]*\).*/\1/p" | head -1)
 # Improve progressively
 f1=$(echo "0.50 + $round * 0.12" | bc -l)
 echo "{\"f1\": $f1}"
@@ -366,7 +366,7 @@ mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/claude" << 'CLAUDE'
 #!/usr/bin/env bash
 prompt=$(cat)
-round=$(echo "$prompt" | grep -oP "Research Round \K[0-9]+" | head -1)
+round=$(echo "$prompt" | sed -n "s/.*Research Round \([0-9][0-9]*\).*/\1/p" | head -1)
 # Each round improves by 0.05
 f1=$(echo "0.50 + $round * 0.05" | bc -l)
 echo "{\"f1\": $f1}"
